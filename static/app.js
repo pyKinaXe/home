@@ -1,3 +1,17 @@
+/*
+Frontend controller for the pyKinaXe web upload page.
+
+This file is intentionally lightweight: the browser handles folder selection,
+ZIP creation, upload progress, and job-status polling, while the scientific
+work stays on the Flask backend. The key UX responsibilities here are:
+
+- validating PTK/STK folder selections
+- packaging uploads for transport
+- showing status/progress messages
+- polling the backend queue/job state
+- rendering returned result summaries and download links
+*/
+
 // Where the API lives. Same-origin by default (local dev / serving from
 // Flask). When deployed on GitHub Pages, set window.PYKINAXE_API_BASE in
 // index.html before this script loads, e.g.
@@ -18,12 +32,177 @@ const kinaseResults = document.getElementById("kinaseResults");
 const heatmapResults = document.getElementById("heatmapResults");
 const downloadAllLink = document.getElementById("downloadAllLink");
 const logPanel = document.getElementById("logPanel");
+const viewerPresenceText = document.getElementById("viewerPresenceText");
 
 let activePollTimer = null;
 let activeJobId = null;
 let heartbeatTimer = null;
+let viewerHeartbeatTimer = null;
 const HEARTBEAT_INTERVAL_MS = 15000;
+const VIEWER_HEARTBEAT_INTERVAL_MS = 10000;
+const VIEWER_ID_KEY = "pykinaxe_viewer_id";
+const VIEWER_SESSION_KEY = "pykinaxe_viewer_session_id";
 
+/**
+ * Generate a random identifier for browser- or tab-level presence tracking.
+ *
+ * @returns {string} Generated identifier string.
+ */
+function generateClientId() {
+  if (window.crypto && typeof window.crypto.randomUUID === "function") {
+    return window.crypto.randomUUID();
+  }
+  return `viewer-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+/**
+ * Return the stable browser-level viewer identifier.
+ *
+ * @returns {string} Persistent identifier shared across tabs in one browser.
+ */
+function getViewerId() {
+  try {
+    let viewerId = window.localStorage.getItem(VIEWER_ID_KEY);
+    if (!viewerId) {
+      viewerId = generateClientId();
+      window.localStorage.setItem(VIEWER_ID_KEY, viewerId);
+    }
+    return viewerId;
+  } catch {
+    return generateClientId();
+  }
+}
+
+/**
+ * Return the per-tab session identifier used for viewer presence.
+ *
+ * @returns {string} Identifier unique to the current browser tab/session.
+ */
+function getViewerSessionId() {
+  try {
+    let sessionId = window.sessionStorage.getItem(VIEWER_SESSION_KEY);
+    if (!sessionId) {
+      sessionId = generateClientId();
+      window.sessionStorage.setItem(VIEWER_SESSION_KEY, sessionId);
+    }
+    return sessionId;
+  } catch {
+    return generateClientId();
+  }
+}
+
+/**
+ * Convert the active-viewer count into a compact badge label.
+ *
+ * @param {number} count - Number of active viewers returned by the backend.
+ * @returns {string} User-facing viewer-count label.
+ */
+function formatViewerPresence(count) {
+  if (!Number.isFinite(count) || count < 0) {
+    return "Online now unavailable";
+  }
+  if (count === 1) {
+    return "1 user online now";
+  }
+  return `${count} users online now`;
+}
+
+/**
+ * Update the visible viewer-presence label in the page corner.
+ *
+ * @param {number} count - Number of active viewers returned by the backend.
+ * @returns {void}
+ */
+function setViewerPresence(count) {
+  if (!viewerPresenceText) return;
+  viewerPresenceText.textContent = formatViewerPresence(count);
+}
+
+/**
+ * Stop the periodic viewer-presence heartbeat timer.
+ *
+ * @returns {void}
+ */
+function stopViewerHeartbeat() {
+  if (viewerHeartbeatTimer !== null) {
+    window.clearInterval(viewerHeartbeatTimer);
+    viewerHeartbeatTimer = null;
+  }
+}
+
+/**
+ * Send one viewer-presence heartbeat and refresh the visible count.
+ *
+ * @returns {Promise<void>}
+ */
+async function sendViewerHeartbeat() {
+  try {
+    const response = await fetch(api("/api/viewers/heartbeat"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        viewer_id: getViewerId(),
+        session_id: getViewerSessionId(),
+      }),
+      keepalive: true,
+    });
+    if (!response.ok) return;
+    const payload = await response.json();
+    setViewerPresence(Number(payload.viewer_count));
+  } catch {
+    if (viewerPresenceText && !viewerPresenceText.textContent.trim()) {
+      viewerPresenceText.textContent = "Online now unavailable";
+    }
+  }
+}
+
+/**
+ * Start the periodic viewer-presence heartbeat loop.
+ *
+ * @returns {void}
+ */
+function startViewerHeartbeat() {
+  stopViewerHeartbeat();
+  void sendViewerHeartbeat();
+  viewerHeartbeatTimer = window.setInterval(() => {
+    void sendViewerHeartbeat();
+  }, VIEWER_HEARTBEAT_INTERVAL_MS);
+}
+
+/**
+ * Notify the backend that this browser tab is no longer viewing the page.
+ *
+ * @returns {void}
+ */
+function releaseViewerPresence() {
+  const sessionId = getViewerSessionId();
+  const viewerId = getViewerId();
+  const payload = new URLSearchParams({
+    viewer_id: viewerId,
+    session_id: sessionId,
+  });
+
+  try {
+    if (navigator.sendBeacon) {
+      navigator.sendBeacon(api("/api/viewers/release"), payload);
+    } else {
+      fetch(api("/api/viewers/release"), {
+        method: "POST",
+        body: payload,
+        keepalive: true,
+      }).catch(() => {});
+    }
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Stop the periodic heartbeat ping for the currently watched job.
+ *
+ * @returns {void}
+ */
+// Stop the periodic heartbeat ping for the currently watched job.
 function stopHeartbeat() {
   if (heartbeatTimer !== null) {
     window.clearInterval(heartbeatTimer);
@@ -31,6 +210,14 @@ function stopHeartbeat() {
   }
 }
 
+/**
+ * Start the heartbeat timer for the active backend job.
+ *
+ * @param {string} jobId - Unique identifier of the job being monitored.
+ * @returns {void}
+ */
+// Start a background heartbeat so the server knows the browser tab is still
+// interested in keeping this job alive.
 function startHeartbeat(jobId) {
   stopHeartbeat();
   activeJobId = jobId;
@@ -45,6 +232,13 @@ function startHeartbeat(jobId) {
   }, HEARTBEAT_INTERVAL_MS);
 }
 
+/**
+ * Notify the backend that the current job can be released.
+ *
+ * @returns {void}
+ */
+// Best-effort signal that the current job can be cleaned up if the user leaves
+// the page or starts over with a different job.
 function releaseActiveJob() {
   if (!activeJobId) return;
   const jobId = activeJobId;
@@ -62,6 +256,12 @@ function releaseActiveJob() {
   }
 }
 
+/**
+ * Clear the browser-side state for the currently active job.
+ *
+ * @returns {void}
+ */
+// Clear the active job bookkeeping held in the browser.
 function clearActiveJob() {
   stopHeartbeat();
   activeJobId = null;
@@ -71,7 +271,16 @@ function clearActiveJob() {
 window.addEventListener("pagehide", releaseActiveJob);
 // beforeunload covers some older Safari paths and reload via address bar.
 window.addEventListener("beforeunload", releaseActiveJob);
+window.addEventListener("pagehide", releaseViewerPresence);
+window.addEventListener("beforeunload", releaseViewerPresence);
 
+/**
+ * Infer the top-level folder name from a `webkitdirectory` file selection.
+ *
+ * @param {FileList|File[]} files - Files selected from one folder chooser.
+ * @returns {string|null} The inferred folder name, or `null` when unavailable.
+ */
+// Infer the top-level selected folder name from a webkitdirectory file list.
 function getSelectedFolderName(files) {
   if (!files || files.length === 0) {
     return null;
@@ -81,11 +290,26 @@ function getSelectedFolderName(files) {
   return relativePath.split("/")[0] || null;
 }
 
+/**
+ * Refresh the visible label for one selected upload folder.
+ *
+ * @param {HTMLInputElement} input - Folder input whose files are being inspected.
+ * @param {HTMLElement} label - Label element updated with the folder name.
+ * @returns {void}
+ */
+// Refresh the visible PTK/STK folder label after a new folder is chosen.
 function updateFolderLabel(input, label) {
   const folderName = getSelectedFolderName(input.files);
   label.textContent = folderName || "No folder selected.";
 }
 
+/**
+ * Decide whether one selected file should be uploaded to the backend.
+ *
+ * @param {File} file - Candidate file from the selected PTK/STK folder.
+ * @returns {boolean} `true` when the file is relevant to the analysis upload.
+ */
+// Keep only the files the backend actually needs from a PamGene run folder.
 function isRelevantUploadFile(file) {
   const relativePath = String(file.webkitRelativePath || file.name || "");
   const upperPath = relativePath.toUpperCase();
@@ -104,6 +328,13 @@ function isRelevantUploadFile(file) {
   return false;
 }
 
+/**
+ * Convert one backend comparison label into a cleaner display label.
+ *
+ * @param {string} value - Raw comparison label returned by the backend.
+ * @returns {string} Human-readable comparison label for the UI.
+ */
+// Normalize backend comparison labels into a more readable frontend form.
 function formatComparisonLabel(value) {
   let text = String(value || "").trim();
   if (text.startsWith("Control_")) {
@@ -115,6 +346,13 @@ function formatComparisonLabel(value) {
   return text.replace(/\bTest(\d+)\b/g, "Test $1");
 }
 
+/**
+ * Derive a compact heatmap title from a generated heatmap filename.
+ *
+ * @param {string} filename - Heatmap filename returned by the backend.
+ * @returns {string} Display-ready heatmap title.
+ */
+// Derive a concise display title from one generated peptide heatmap filename.
 function formatHeatmapTitle(filename) {
   // Strip extension and the well-known prefix, then take the last
   // underscore-delimited token (the test condition), e.g.
@@ -129,11 +367,48 @@ function formatHeatmapTitle(filename) {
   return formatComparisonLabel(text);
 }
 
+/**
+ * Update the shared status banner shown during upload and analysis.
+ *
+ * @param {string} kind - Status kind controlling the banner styling.
+ * @param {string} message - Human-readable status message.
+ * @returns {void}
+ */
+// Update the shared status banner shown to the user during upload and analysis.
 function setStatus(kind, message) {
   statusBox.className = `status ${kind}`;
   statusText.textContent = message;
 }
 
+/**
+ * Format the queue metadata returned by the backend into UI text.
+ *
+ * @param {Object} payload - Job-status payload returned by the backend.
+ * @returns {string} Queue status text for the user.
+ */
+// Build the user-facing queue message from the backend queue metadata.
+function formatQueuedStatus(payload) {
+  const queuePosition = Number(payload.queue_position);
+  const jobsAhead = Number(payload.jobs_ahead);
+
+  if (Number.isFinite(queuePosition) && queuePosition > 0) {
+    if (Number.isFinite(jobsAhead) && jobsAhead >= 0) {
+      const aheadLabel = jobsAhead === 1 ? "job" : "jobs";
+      return `Queued: position ${queuePosition} (${jobsAhead} ${aheadLabel} ahead).`;
+    }
+    return `Queued: position ${queuePosition}.`;
+  }
+
+  return payload.message || "Job is queued.";
+}
+
+/**
+ * Render the rolling log entries for the current backend job.
+ *
+ * @param {Object} payload - Job-status payload containing log entries.
+ * @returns {void}
+ */
+// Render the rolling per-job log stream returned by the backend.
 function renderLogs(payload) {
   const logs = payload.logs || [];
   if (logs.length === 0) {
@@ -159,6 +434,13 @@ function renderLogs(payload) {
   logPanel.scrollTop = logPanel.scrollHeight;
 }
 
+/**
+ * Convert a backend-relative URL into one usable by the current frontend.
+ *
+ * @param {string} url - Relative or absolute URL returned by the backend.
+ * @returns {string} Absolute URL suitable for links and image tags.
+ */
+// Prefix backend-relative URLs when the frontend is hosted on another origin.
 function absolutize(url) {
   // Server returns paths like "/api/jobs/<id>/download". Prefix with API_BASE
   // when the frontend is hosted on a different origin (GitHub Pages).
@@ -168,6 +450,13 @@ function absolutize(url) {
   return url;
 }
 
+/**
+ * Render the completed-job outputs in the results panel.
+ *
+ * @param {Object} payload - Completed job payload returned by the backend.
+ * @returns {void}
+ */
+// Render the completed-job outputs such as workbooks, heatmaps, and downloads.
 function renderResults(payload) {
   const results = payload.results;
   resultsPanel.classList.remove("hidden");
@@ -214,6 +503,13 @@ function renderResults(payload) {
   }
 }
 
+/**
+ * Poll the backend until the requested job reaches a terminal state.
+ *
+ * @param {string} jobId - Unique identifier of the job being monitored.
+ * @returns {Promise<void>}
+ */
+// Poll the backend until the current job reaches a terminal state.
 async function pollJob(jobId) {
   const response = await fetch(api(`/api/jobs/${jobId}`));
   if (!response.ok) {
@@ -229,7 +525,13 @@ async function pollJob(jobId) {
   const payload = await response.json();
   renderLogs(payload);
 
-  if (payload.status === "queued" || payload.status === "running") {
+  if (payload.status === "queued") {
+    setStatus("running", formatQueuedStatus(payload));
+    activePollTimer = window.setTimeout(() => pollJob(jobId), 2500);
+    return;
+  }
+
+  if (payload.status === "starting" || payload.status === "running") {
     setStatus("running", payload.message || "Analysis is running...");
     activePollTimer = window.setTimeout(() => pollJob(jobId), 2500);
     return;
@@ -252,6 +554,13 @@ async function pollJob(jobId) {
   }
 }
 
+/**
+ * Run the complete browser-side upload and queueing workflow.
+ *
+ * @returns {Promise<void>}
+ */
+// Drive the complete browser-side workflow: validate folders, upload data,
+// queue the job, and begin polling for results.
 async function startUpload() {
   if (activePollTimer !== null) {
     window.clearTimeout(activePollTimer);
@@ -304,6 +613,13 @@ async function startUpload() {
       throw new Error("JSZip failed to load in the browser.");
     }
 
+    /**
+     * Build one ZIP archive in the browser from a folder selection.
+     *
+     * @param {string} kind - Upload kind, usually `ptk` or `stk`.
+     * @param {File[]} files - Relevant files selected from the chosen folder.
+     * @returns {Promise<Blob>} ZIP blob ready for upload.
+     */
     // Build a ZIP in the browser by reading each File SEQUENTIALLY into
     // bytes. Safari's "I/O read" / "Load failed" errors come from JSZip's
     // streaming generator opening many webkitdirectory File handles at the
@@ -350,6 +666,13 @@ async function startUpload() {
       );
     }
 
+    /**
+     * Upload one prepared ZIP blob to the matching backend endpoint.
+     *
+     * @param {string} kind - Upload kind, usually `ptk` or `stk`.
+     * @param {Blob} blob - ZIP blob produced from one selected folder.
+     * @returns {Promise<Object|null>} Parsed backend response payload.
+     */
     // Use XMLHttpRequest for the upload: it gives a real upload-progress
     // event and surfaces a meaningful error when Safari aborts, unlike
     // fetch() which just throws "Load failed".
@@ -402,6 +725,15 @@ async function startUpload() {
       });
     }
 
+    /**
+     * ZIP and upload one selected PTK/STK folder.
+     *
+     * @param {string} kind - Upload kind, usually `ptk` or `stk`.
+     * @param {File[]} files - Relevant files selected from the chosen folder.
+     * @returns {Promise<void>}
+     */
+    // Package one selected PTK/STK folder into a ZIP and upload it to the
+    // matching backend endpoint.
     async function zipAndUploadFolder(kind, files) {
       const blob = await buildZipBlob(kind, files);
       const sizeMB = (blob.size / (1024 * 1024)).toFixed(1);
@@ -425,7 +757,11 @@ async function startUpload() {
       throw new Error(startPayload.error || "Job start failed.");
     }
 
-    setStatus("running", startPayload.message || "Analysis queued.");
+    if (startPayload.status === "queued") {
+      setStatus("running", formatQueuedStatus(startPayload));
+    } else {
+      setStatus("running", startPayload.message || "Analysis queued.");
+    }
     renderLogs(startPayload);
     await pollJob(jobId);
   } catch (error) {
@@ -437,7 +773,11 @@ async function startUpload() {
   }
 }
 
+// The main action button launches the end-to-end upload and analysis flow.
 runButton.addEventListener("click", startUpload);
 
+// Keep the visible folder labels in sync with the selected upload folders.
 ptkFolderInput.addEventListener("change", () => updateFolderLabel(ptkFolderInput, ptkFolderLabel));
 stkFolderInput.addEventListener("change", () => updateFolderLabel(stkFolderInput, stkFolderLabel));
+
+startViewerHeartbeat();

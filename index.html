@@ -7,10 +7,15 @@
   <link rel="stylesheet" href="./static/styles.css">
 </head>
 <body>
+  <div class="viewer-presence" aria-live="polite">
+    <span class="viewer-presence-dot" aria-hidden="true"></span>
+    <span id="viewerPresenceText">Checking who is online...</span>
+  </div>
+
   <main class="page">
     <section class="hero">
       <p class="eyebrow"><span class="eyebrow-py">py</span>Kina<span class="eyebrow-x">X</span>e</p>
-      <h2>Extraction of Kinases from Phosphorelated Peptide Data</h2>
+      <h2>Extraction of Kinases from Phosphorylated Peptide Data</h2>
       <p class="lede">
         Choose one PTK run folder and one STK run folder, and press 'eXtract Kinases' button.
         <br>
@@ -77,12 +82,6 @@
     </section>
   </main>
 
-  <!-- Point the static frontend at the Hugging Face Space backend.
-       Replace <username> with your HF username (and the space name if you
-       used something other than "pykinaxe"). -->
-  <script>
-    window.PYKINAXE_API_BASE = "https://ZumbiAzul-pykinaxe.hf.space";
-  </script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <script src="static/app.js"></script>
 </body>
