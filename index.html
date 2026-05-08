@@ -82,6 +82,11 @@
     </section>
   </main>
 
+  <script>
+    if (!window.PYKINAXE_API_BASE && window.location.hostname === "pykinaxe.github.io") {
+      window.PYKINAXE_API_BASE = "https://zumbiazul-pykinaxe.hf.space";
+    }
+  </script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <script src="static/app.js"></script>
 </body>
