@@ -542,9 +542,12 @@ async function autoDownloadResults(payload) {
     const filenameMatch =
       contentDisposition.match(/filename\*=UTF-8''([^;]+)/i) ||
       contentDisposition.match(/filename=\"?([^\";]+)\"?/i);
+    const analysisTimestamp = String(results.analysis_timestamp || "")
+      .trim()
+      .replace(/[^0-9A-Za-z_-]+/g, "_");
     const suggestedFilename = filenameMatch
       ? decodeURIComponent(filenameMatch[1])
-      : `pyKinaXe_results_${jobId}.zip`;
+      : `${analysisTimestamp || "results"}_pyKinaXe_results.zip`;
 
     let archiveBlob;
     if (response.body && typeof response.body.getReader === "function") {
