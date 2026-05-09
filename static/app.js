@@ -39,7 +39,6 @@ let activeJobId = null;
 let heartbeatTimer = null;
 let viewerHeartbeatTimer = null;
 let autoDownloadInFlight = false;
-let activeDownloadFrame = null;
 const HEARTBEAT_INTERVAL_MS = 15000;
 const VIEWER_HEARTBEAT_INTERVAL_MS = 10000;
 const VIEWER_ID_KEY = "pykinaxe_viewer_id";
@@ -392,13 +391,23 @@ function setStatus(kind, message) {
 function formatQueuedStatus(payload) {
   const queuePosition = Number(payload.queue_position);
   const jobsAhead = Number(payload.jobs_ahead);
+  const status = String(payload.status || "");
+
+  let prefix = "Queued";
+  if (status === "waiting_for_upload") {
+    prefix = "Waiting for upload turn";
+  } else if (status === "queued") {
+    prefix = "Upload complete. Waiting for analysis";
+  } else if (status === "upload_ready") {
+    prefix = "Upload turn ready";
+  }
 
   if (Number.isFinite(queuePosition) && queuePosition > 0) {
     if (Number.isFinite(jobsAhead) && jobsAhead >= 0) {
       const aheadLabel = jobsAhead === 1 ? "job" : "jobs";
-      return `Queued: position ${queuePosition} (${jobsAhead} ${aheadLabel} ahead).`;
+      return `${prefix}: position ${queuePosition} (${jobsAhead} ${aheadLabel} ahead).`;
     }
-    return `Queued: position ${queuePosition}.`;
+    return `${prefix}: position ${queuePosition}.`;
   }
 
   return payload.message || "Job is queued.";
@@ -523,16 +532,13 @@ async function autoDownloadResults(payload) {
 
   try {
     setStatus("completed", "Analysis finished. Downloading ZIP archive...");
-    if (activeDownloadFrame) {
-      activeDownloadFrame.remove();
-      activeDownloadFrame = null;
-    }
-
-    const iframe = document.createElement("iframe");
-    iframe.hidden = true;
-    iframe.src = downloadUrl;
-    document.body.appendChild(iframe);
-    activeDownloadFrame = iframe;
+    const link = document.createElement("a");
+    link.href = downloadUrl;
+    link.rel = "noopener";
+    link.style.display = "none";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
 
     if (activeJobId === jobId) {
       clearActiveJob();
@@ -553,13 +559,195 @@ async function autoDownloadResults(payload) {
 }
 
 /**
+ * Build one ZIP archive in the browser from a folder selection.
+ *
+ * @param {string} kind - Upload kind, usually `ptk` or `stk`.
+ * @param {File[]} files - Relevant files selected from the chosen folder.
+ * @returns {Promise<Blob>} ZIP blob ready for upload.
+ */
+async function buildZipBlob(kind, files) {
+  const zip = new JSZip();
+  for (let i = 0; i < files.length; i += 1) {
+    const file = files[i];
+    const relativePath = file.webkitRelativePath || file.name;
+    let bytes;
+    try {
+      bytes = await file.arrayBuffer();
+    } catch (err) {
+      throw new Error(
+        `Could not read ${relativePath} from disk (${err && err.message ? err.message : err}). ` +
+          "Safari sometimes loses access to a webkitdirectory selection — " +
+          "please re-select the folder and try again."
+      );
+    }
+    zip.file(relativePath, bytes);
+    if (i % 10 === 0 || i === files.length - 1) {
+      setStatus(
+        "running",
+        `Reading ${kind.toUpperCase()} files (${i + 1}/${files.length})...`
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
+
+  setStatus("running", `Compressing ${kind.toUpperCase()} ZIP (0%)...`);
+  return zip.generateAsync(
+    { type: "blob", compression: "STORE", streamFiles: false },
+    (metadata) => {
+      if (metadata && typeof metadata.percent === "number") {
+        setStatus(
+          "running",
+          `Compressing ${kind.toUpperCase()} ZIP (${Math.round(metadata.percent)}%)...`
+        );
+      }
+    }
+  );
+}
+
+/**
+ * Upload one prepared ZIP blob to the matching backend endpoint.
+ *
+ * @param {string} jobId - Unique identifier of the active upload job.
+ * @param {string} kind - Upload kind, usually `ptk` or `stk`.
+ * @param {Blob} blob - ZIP blob produced from one selected folder.
+ * @returns {Promise<Object|null>} Parsed backend response payload.
+ */
+function uploadZipBlob(jobId, kind, blob) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const url = api(`/api/jobs/${jobId}/upload_zip?kind=${encodeURIComponent(kind)}`);
+    xhr.open("POST", url, true);
+
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) {
+        const percent = Math.round((event.loaded / event.total) * 100);
+        setStatus(
+          "running",
+          `Uploading ${kind.toUpperCase()} ZIP (${percent}%)...`
+        );
+      }
+    };
+
+    xhr.onload = () => {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(xhr.responseText || "null");
+      } catch {
+        parsed = null;
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(parsed);
+        return;
+      }
+      const message =
+        (parsed && parsed.error) ||
+        `Upload of ${kind.toUpperCase()} ZIP failed (HTTP ${xhr.status}).`;
+      reject(new Error(message));
+    };
+
+    xhr.onerror = () =>
+      reject(
+        new Error(
+          `Network error while uploading ${kind.toUpperCase()} ZIP. ` +
+            "Check that the local server is still running."
+        )
+      );
+    xhr.onabort = () =>
+      reject(new Error(`Upload of ${kind.toUpperCase()} ZIP was aborted.`));
+
+    const formData = new FormData();
+    formData.append("archive", blob, `${kind}.zip`);
+    xhr.send(formData);
+  });
+}
+
+/**
+ * ZIP and upload one selected PTK/STK folder.
+ *
+ * @param {string} jobId - Unique identifier of the active upload job.
+ * @param {string} kind - Upload kind, usually `ptk` or `stk`.
+ * @param {File[]} files - Relevant files selected from the chosen folder.
+ * @returns {Promise<void>}
+ */
+async function zipAndUploadFolder(jobId, kind, files) {
+  const blob = await buildZipBlob(kind, files);
+  const sizeMB = (blob.size / (1024 * 1024)).toFixed(1);
+  setStatus("running", `Uploading ${kind.toUpperCase()} ZIP (${sizeMB} MB)...`);
+  const responsePayload = await uploadZipBlob(jobId, kind, blob);
+  if (responsePayload) renderLogs(responsePayload);
+}
+
+/**
+ * Ask the backend for the current upload turn, then send the selected folders.
+ *
+ * @param {string} jobId - Unique identifier of the queued job.
+ * @param {{ptkFiles: File[], stkFiles: File[], started: boolean}} uploadPlan - Files held in the browser until the queue reaches this user.
+ * @returns {Promise<void>}
+ */
+async function beginQueuedUpload(jobId, uploadPlan) {
+  if (!uploadPlan || uploadPlan.started) return;
+  uploadPlan.started = true;
+
+  try {
+    setStatus("running", "Your turn has arrived. Preparing a clean upload workspace...");
+    const beginResponse = await fetch(api(`/api/jobs/${jobId}/begin_upload`), {
+      method: "POST",
+    });
+
+    let beginPayload;
+    try {
+      beginPayload = await beginResponse.json();
+    } catch {
+      throw new Error(`Upload turn request failed with HTTP ${beginResponse.status}.`);
+    }
+    if (!beginResponse.ok) {
+      throw new Error(beginPayload.error || "Upload turn request failed.");
+    }
+
+    renderLogs(beginPayload);
+
+    if (typeof JSZip === "undefined") {
+      throw new Error("JSZip failed to load in the browser.");
+    }
+
+    await zipAndUploadFolder(jobId, "ptk", uploadPlan.ptkFiles);
+    await zipAndUploadFolder(jobId, "stk", uploadPlan.stkFiles);
+
+    setStatus("running", "Starting analysis job...");
+    const startResponse = await fetch(api(`/api/jobs/${jobId}/start`), { method: "POST" });
+    let startPayload;
+    try {
+      startPayload = await startResponse.json();
+    } catch {
+      throw new Error(`Job start failed with HTTP ${startResponse.status}.`);
+    }
+    if (!startResponse.ok) {
+      throw new Error(startPayload.error || "Job start failed.");
+    }
+
+    renderLogs(startPayload);
+    if (startPayload.status === "queued") {
+      setStatus("running", formatQueuedStatus(startPayload));
+    } else {
+      setStatus("running", startPayload.message || "Analysis queued.");
+    }
+
+    await pollJob(jobId, uploadPlan);
+  } catch (error) {
+    uploadPlan.started = false;
+    throw error;
+  }
+}
+
+/**
  * Poll the backend until the requested job reaches a terminal state.
  *
  * @param {string} jobId - Unique identifier of the job being monitored.
+ * @param {{ptkFiles: File[], stkFiles: File[], started: boolean}|null} uploadPlan - Client-side files held until the upload turn begins.
  * @returns {Promise<void>}
  */
 // Poll the backend until the current job reaches a terminal state.
-async function pollJob(jobId) {
+async function pollJob(jobId, uploadPlan = null) {
   const response = await fetch(api(`/api/jobs/${jobId}`));
   if (!response.ok) {
     if (response.status === 404) {
@@ -574,21 +762,51 @@ async function pollJob(jobId) {
   const payload = await response.json();
   renderLogs(payload);
 
+  if (payload.status === "waiting_for_upload") {
+    setStatus("running", formatQueuedStatus(payload));
+    activePollTimer = window.setTimeout(() => pollJob(jobId, uploadPlan), 2500);
+    return;
+  }
+
+  if (payload.status === "upload_ready") {
+    setStatus("running", payload.message || formatQueuedStatus(payload));
+    if (uploadPlan && !uploadPlan.started) {
+      try {
+        await beginQueuedUpload(jobId, uploadPlan);
+      } catch (error) {
+        setStatus("failed", error.message || "Unexpected error during upload.");
+        runButton.disabled = false;
+        releaseActiveJob();
+        clearActiveJob();
+      }
+      return;
+    }
+    activePollTimer = window.setTimeout(() => pollJob(jobId, uploadPlan), 1500);
+    return;
+  }
+
+  if (payload.status === "uploading") {
+    setStatus("running", payload.message || "Uploading selected PTK/STK data...");
+    activePollTimer = window.setTimeout(() => pollJob(jobId, uploadPlan), 2500);
+    return;
+  }
+
   if (payload.status === "queued") {
     setStatus("running", formatQueuedStatus(payload));
-    activePollTimer = window.setTimeout(() => pollJob(jobId), 2500);
+    activePollTimer = window.setTimeout(() => pollJob(jobId, uploadPlan), 2500);
     return;
   }
 
   if (payload.status === "starting" || payload.status === "running") {
     setStatus("running", payload.message || "Analysis is running...");
-    activePollTimer = window.setTimeout(() => pollJob(jobId), 2500);
+    activePollTimer = window.setTimeout(() => pollJob(jobId, uploadPlan), 2500);
     return;
   }
 
   if (payload.status === "failed") {
     setStatus("failed", payload.error || payload.message || "Analysis failed.");
     runButton.disabled = false;
+    releaseActiveJob();
     clearActiveJob();
     return;
   }
@@ -630,7 +848,7 @@ async function startUpload() {
   resultsPanel.classList.add("hidden");
   downloadAllLink.hidden = true;
   downloadAllLink.removeAttribute("href");
-  logPanel.innerHTML = `<div class="log-empty">Preparing upload...</div>`;
+  logPanel.innerHTML = `<div class="log-empty">Joining the upload queue...</div>`;
 
   try {
     if (ptkFiles.length === 0 || stkFiles.length === 0) {
@@ -657,161 +875,13 @@ async function startUpload() {
     const jobId = payload.job_id;
     startHeartbeat(jobId);
 
-    if (typeof JSZip === "undefined") {
-      throw new Error("JSZip failed to load in the browser.");
-    }
-
-    /**
-     * Build one ZIP archive in the browser from a folder selection.
-     *
-     * @param {string} kind - Upload kind, usually `ptk` or `stk`.
-     * @param {File[]} files - Relevant files selected from the chosen folder.
-     * @returns {Promise<Blob>} ZIP blob ready for upload.
-     */
-    // Build a ZIP in the browser by reading each File SEQUENTIALLY into
-    // bytes. Safari's "I/O read" / "Load failed" errors come from JSZip's
-    // streaming generator opening many webkitdirectory File handles at the
-    // same time. Reading one at a time keeps exactly one handle open.
-    async function buildZipBlob(kind, files) {
-      const zip = new JSZip();
-      for (let i = 0; i < files.length; i += 1) {
-        const file = files[i];
-        const relativePath = file.webkitRelativePath || file.name;
-        let bytes;
-        try {
-          bytes = await file.arrayBuffer();
-        } catch (err) {
-          throw new Error(
-            `Could not read ${relativePath} from disk (${err && err.message ? err.message : err}). ` +
-              "Safari sometimes loses access to a webkitdirectory selection — " +
-              "please re-select the folder and try again."
-          );
-        }
-        zip.file(relativePath, bytes);
-        if (i % 10 === 0 || i === files.length - 1) {
-          setStatus(
-            "running",
-            `Reading ${kind.toUpperCase()} files (${i + 1}/${files.length})...`
-          );
-          // Yield to the event loop so Safari can repaint and stay responsive.
-          await new Promise((resolve) => setTimeout(resolve, 0));
-        }
-      }
-
-      setStatus("running", `Compressing ${kind.toUpperCase()} ZIP (0%)...`);
-      // STORE: TIFFs are already incompressible; skipping DEFLATE avoids
-      // CPU/memory stalls in Safari for large folders.
-      return zip.generateAsync(
-        { type: "blob", compression: "STORE", streamFiles: false },
-        (metadata) => {
-          if (metadata && typeof metadata.percent === "number") {
-            setStatus(
-              "running",
-              `Compressing ${kind.toUpperCase()} ZIP (${Math.round(metadata.percent)}%)...`
-            );
-          }
-        }
-      );
-    }
-
-    /**
-     * Upload one prepared ZIP blob to the matching backend endpoint.
-     *
-     * @param {string} kind - Upload kind, usually `ptk` or `stk`.
-     * @param {Blob} blob - ZIP blob produced from one selected folder.
-     * @returns {Promise<Object|null>} Parsed backend response payload.
-     */
-    // Use XMLHttpRequest for the upload: it gives a real upload-progress
-    // event and surfaces a meaningful error when Safari aborts, unlike
-    // fetch() which just throws "Load failed".
-    function uploadZipBlob(kind, blob) {
-      return new Promise((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-        const url = api(`/api/jobs/${jobId}/upload_zip?kind=${encodeURIComponent(kind)}`);
-        xhr.open("POST", url, true);
-
-        xhr.upload.onprogress = (event) => {
-          if (event.lengthComputable && event.total > 0) {
-            const percent = Math.round((event.loaded / event.total) * 100);
-            setStatus(
-              "running",
-              `Uploading ${kind.toUpperCase()} ZIP (${percent}%)...`
-            );
-          }
-        };
-
-        xhr.onload = () => {
-          let parsed = null;
-          try {
-            parsed = JSON.parse(xhr.responseText || "null");
-          } catch {
-            parsed = null;
-          }
-          if (xhr.status >= 200 && xhr.status < 300) {
-            resolve(parsed);
-            return;
-          }
-          const message =
-            (parsed && parsed.error) ||
-            `Upload of ${kind.toUpperCase()} ZIP failed (HTTP ${xhr.status}).`;
-          reject(new Error(message));
-        };
-
-        xhr.onerror = () =>
-          reject(
-            new Error(
-              `Network error while uploading ${kind.toUpperCase()} ZIP. ` +
-                "Check that the local server is still running."
-            )
-          );
-        xhr.onabort = () =>
-          reject(new Error(`Upload of ${kind.toUpperCase()} ZIP was aborted.`));
-
-        const formData = new FormData();
-        formData.append("archive", blob, `${kind}.zip`);
-        xhr.send(formData);
-      });
-    }
-
-    /**
-     * ZIP and upload one selected PTK/STK folder.
-     *
-     * @param {string} kind - Upload kind, usually `ptk` or `stk`.
-     * @param {File[]} files - Relevant files selected from the chosen folder.
-     * @returns {Promise<void>}
-     */
-    // Package one selected PTK/STK folder into a ZIP and upload it to the
-    // matching backend endpoint.
-    async function zipAndUploadFolder(kind, files) {
-      const blob = await buildZipBlob(kind, files);
-      const sizeMB = (blob.size / (1024 * 1024)).toFixed(1);
-      setStatus("running", `Uploading ${kind.toUpperCase()} ZIP (${sizeMB} MB)...`);
-      const responsePayload = await uploadZipBlob(kind, blob);
-      if (responsePayload) renderLogs(responsePayload);
-    }
-
-    await zipAndUploadFolder("ptk", ptkRelevantFiles);
-    await zipAndUploadFolder("stk", stkRelevantFiles);
-
-    setStatus("running", "Starting analysis job...");
-    const startResponse = await fetch(api(`/api/jobs/${jobId}/start`), { method: "POST" });
-    let startPayload;
-    try {
-      startPayload = await startResponse.json();
-    } catch {
-      throw new Error(`Job start failed with HTTP ${startResponse.status}.`);
-    }
-    if (!startResponse.ok) {
-      throw new Error(startPayload.error || "Job start failed.");
-    }
-
-    if (startPayload.status === "queued") {
-      setStatus("running", formatQueuedStatus(startPayload));
-    } else {
-      setStatus("running", startPayload.message || "Analysis queued.");
-    }
-    renderLogs(startPayload);
-    await pollJob(jobId);
+    renderLogs(payload);
+    const uploadPlan = {
+      ptkFiles: ptkRelevantFiles,
+      stkFiles: stkRelevantFiles,
+      started: false,
+    };
+    await pollJob(jobId, uploadPlan);
   } catch (error) {
     setStatus("failed", error.message || "Unexpected error during upload.");
     runButton.disabled = false;
