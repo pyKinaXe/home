@@ -38,10 +38,15 @@ let activeJobId = null;
 let heartbeatTimer = null;
 let viewerHeartbeatTimer = null;
 let autoDownloadInFlight = false;
+let backendReady = false;
+let backendWarmupPromise = null;
 const HEARTBEAT_INTERVAL_MS = 15000;
 const VIEWER_HEARTBEAT_INTERVAL_MS = 10000;
+const BACKEND_WARMUP_MAX_ATTEMPTS = 24;
+const BACKEND_WARMUP_INTERVAL_MS = 2500;
 const VIEWER_ID_KEY = "pykinaxe_viewer_id";
 const VIEWER_SESSION_KEY = "pykinaxe_viewer_session_id";
+const DEFAULT_IDLE_STATUS = "Waiting for input.";
 
 /**
  * Generate a random identifier for browser- or tab-level presence tracking.
@@ -381,6 +386,115 @@ function setStatus(kind, message) {
 }
 
 /**
+ * Pause for a short amount of time.
+ *
+ * @param {number} ms - Delay in milliseconds.
+ * @returns {Promise<void>}
+ */
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+/**
+ * Return whether an HTTP response likely reflects a sleeping or restarting Space.
+ *
+ * @param {Response} response - Fetch response to classify.
+ * @returns {boolean} Whether the request should be retried after warm-up.
+ */
+function shouldRetryWake(response) {
+  return !!response && [500, 502, 503, 504].includes(Number(response.status));
+}
+
+/**
+ * Wait for the Hugging Face Space backend to become responsive.
+ *
+ * @param {{announce?: boolean, force?: boolean}} options - Warm-up options.
+ * @returns {Promise<void>}
+ */
+async function ensureBackendReady(options = {}) {
+  const { announce = false, force = false } = options;
+
+  if (backendReady && !force) return;
+  if (backendWarmupPromise) {
+    await backendWarmupPromise;
+    return;
+  }
+
+  backendWarmupPromise = (async () => {
+    if (announce && !activeJobId) {
+      setStatus("running", "Waking up pyKinaXe server...");
+    }
+
+    for (let attempt = 1; attempt <= BACKEND_WARMUP_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        const response = await fetch(api("/api/health"), {
+          method: "GET",
+          cache: "no-store",
+        });
+        if (response.ok) {
+          backendReady = true;
+          if (announce && !activeJobId && statusText.textContent.includes("Waking up pyKinaXe server")) {
+            setStatus("idle", DEFAULT_IDLE_STATUS);
+          }
+          return;
+        }
+      } catch {
+        // Keep polling while the Space wakes up.
+      }
+
+      if (announce && !activeJobId) {
+        setStatus(
+          "running",
+          "Waking up pyKinaXe server... this can take a little while if the Space was asleep."
+        );
+      }
+      await sleep(BACKEND_WARMUP_INTERVAL_MS);
+    }
+
+    throw new Error("pyKinaXe server is still waking up. Please wait a moment and try again.");
+  })();
+
+  try {
+    await backendWarmupPromise;
+  } finally {
+    backendWarmupPromise = null;
+  }
+}
+
+/**
+ * Fetch one API resource and retry once after an explicit warm-up cycle when
+ * the backend looks asleep or temporarily unavailable.
+ *
+ * @param {string} url - Absolute or API-relative URL to fetch.
+ * @param {RequestInit} options - Fetch options.
+ * @param {{announceWake?: boolean}} extra - Retry behavior options.
+ * @returns {Promise<Response>} Final fetch response.
+ */
+async function fetchWithWake(url, options = {}, extra = {}) {
+  const { announceWake = false } = extra;
+
+  try {
+    const response = await fetch(url, options);
+    if (!shouldRetryWake(response)) {
+      if (response.ok) {
+        backendReady = true;
+      }
+      return response;
+    }
+  } catch {
+    // Network failures can happen while the Space is still starting up.
+  }
+
+  backendReady = false;
+  await ensureBackendReady({ announce: announceWake, force: true });
+  const retryResponse = await fetch(url, options);
+  if (retryResponse.ok) {
+    backendReady = true;
+  }
+  return retryResponse;
+}
+
+/**
  * Format the queue metadata returned by the backend into UI text.
  *
  * @param {Object} payload - Job-status payload returned by the backend.
@@ -562,7 +676,7 @@ async function autoDownloadResults(payload) {
 
   try {
     setStatus("completed", "Analysis finished. Downloading ZIP archive...");
-    const response = await fetch(downloadUrl);
+    const response = await fetchWithWake(downloadUrl, { method: "GET" }, { announceWake: true });
     if (!response.ok) {
       throw new Error(`ZIP download failed with HTTP ${response.status}.`);
     }
@@ -622,9 +736,11 @@ async function autoDownloadResults(payload) {
     }
 
     setStatus("completed", "ZIP archive saved in the browser. Cleaning bucket-backed runtime...");
-    const cleanupResponse = await fetch(api(`/api/jobs/${jobId}/finalize_download`), {
-      method: "POST",
-    });
+    const cleanupResponse = await fetchWithWake(
+      api(`/api/jobs/${jobId}/finalize_download`),
+      { method: "POST" },
+      { announceWake: true }
+    );
     if (!cleanupResponse.ok) {
       let cleanupPayload = null;
       try {
@@ -786,9 +902,11 @@ async function beginQueuedUpload(jobId, uploadPlan) {
 
   try {
     setStatus("running", "Your turn has arrived. Preparing a clean upload workspace...");
-    const beginResponse = await fetch(api(`/api/jobs/${jobId}/begin_upload`), {
-      method: "POST",
-    });
+    const beginResponse = await fetchWithWake(
+      api(`/api/jobs/${jobId}/begin_upload`),
+      { method: "POST" },
+      { announceWake: true }
+    );
 
     let beginPayload;
     try {
@@ -810,7 +928,11 @@ async function beginQueuedUpload(jobId, uploadPlan) {
     await zipAndUploadFolder(jobId, "stk", uploadPlan.stkFiles);
 
     setStatus("running", "Starting analysis job...");
-    const startResponse = await fetch(api(`/api/jobs/${jobId}/start`), { method: "POST" });
+    const startResponse = await fetchWithWake(
+      api(`/api/jobs/${jobId}/start`),
+      { method: "POST" },
+      { announceWake: true }
+    );
     let startPayload;
     try {
       startPayload = await startResponse.json();
@@ -844,7 +966,11 @@ async function beginQueuedUpload(jobId, uploadPlan) {
  */
 // Poll the backend until the current job reaches a terminal state.
 async function pollJob(jobId, uploadPlan = null) {
-  const response = await fetch(api(`/api/jobs/${jobId}`));
+  const response = await fetchWithWake(
+    api(`/api/jobs/${jobId}`),
+    { method: "GET", cache: "no-store" },
+    { announceWake: false }
+  );
   if (!response.ok) {
     if (response.status === 404) {
       setStatus("failed", "This job is no longer available on the server.");
@@ -953,8 +1079,13 @@ async function startUpload() {
       throw new Error("The selected folder does not contain the expected ImageResults TIFFs and annotation/layout text files.");
     }
 
+    await ensureBackendReady({ announce: true });
     setStatus("running", "Creating analysis job...");
-    const initResponse = await fetch(api("/api/jobs/init"), { method: "POST" });
+    const initResponse = await fetchWithWake(
+      api("/api/jobs/init"),
+      { method: "POST" },
+      { announceWake: true }
+    );
 
     let payload;
     try {
@@ -992,4 +1123,5 @@ runButton.addEventListener("click", startUpload);
 ptkFolderInput.addEventListener("change", () => updateFolderLabel(ptkFolderInput, ptkFolderLabel));
 stkFolderInput.addEventListener("change", () => updateFolderLabel(stkFolderInput, stkFolderLabel));
 
+void ensureBackendReady().catch(() => {});
 startViewerHeartbeat();
