@@ -640,7 +640,7 @@ async function autoDownloadResults(payload) {
 
     setStatus(
       "completed",
-      "Results downloaded. Bucket cleanup completed, and the next queued upload can proceed."
+      "Results downloaded, pyKinaXe is ready for the next upload!"
     );
     appendClientLog("Results downloaded.");
   } catch (error) {
