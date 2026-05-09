@@ -822,9 +822,11 @@ async function buildZipBlob(kind, files) {
  * @param {string} jobId - Unique identifier of the active upload job.
  * @param {string} kind - Upload kind, usually `ptk` or `stk`.
  * @param {Blob} blob - ZIP blob produced from one selected folder.
+ * @param {{retryStatuses?: number[]}} options - Upload retry options.
  * @returns {Promise<Object|null>} Parsed backend response payload.
  */
-function uploadZipBlob(jobId, kind, blob) {
+function uploadZipBlobOnce(jobId, kind, blob, options = {}) {
+  const retryStatuses = Array.isArray(options.retryStatuses) ? options.retryStatuses : [];
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const url = api(`/api/jobs/${jobId}/upload_zip?kind=${encodeURIComponent(kind)}`);
@@ -851,26 +853,63 @@ function uploadZipBlob(jobId, kind, blob) {
         resolve(parsed);
         return;
       }
-      const message =
+      const error = new Error(
         (parsed && parsed.error) ||
-        `Upload of ${kind.toUpperCase()} ZIP failed (HTTP ${xhr.status}).`;
-      reject(new Error(message));
+        `Upload of ${kind.toUpperCase()} ZIP failed (HTTP ${xhr.status}).`
+      );
+      error.httpStatus = xhr.status;
+      error.retryWake = retryStatuses.includes(xhr.status);
+      reject(error);
     };
 
-    xhr.onerror = () =>
-      reject(
-        new Error(
-          `Network error while uploading ${kind.toUpperCase()} ZIP. ` +
-            "Check that the local server is still running."
-        )
+    xhr.onerror = () => {
+      const error = new Error(
+        `Network error while uploading ${kind.toUpperCase()} ZIP. ` +
+          "The pyKinaXe server may still be waking up."
       );
-    xhr.onabort = () =>
-      reject(new Error(`Upload of ${kind.toUpperCase()} ZIP was aborted.`));
+      error.retryWake = true;
+      reject(error);
+    };
+    xhr.onabort = () => {
+      const error = new Error(`Upload of ${kind.toUpperCase()} ZIP was aborted.`);
+      error.retryWake = false;
+      reject(error);
+    };
 
     const formData = new FormData();
     formData.append("archive", blob, `${kind}.zip`);
     xhr.send(formData);
   });
+}
+
+/**
+ * Upload one ZIP archive, retrying once if the Space is still rebuilding.
+ *
+ * @param {string} jobId - Unique identifier of the active upload job.
+ * @param {string} kind - Upload kind, usually `ptk` or `stk`.
+ * @param {Blob} blob - ZIP blob produced from one selected folder.
+ * @returns {Promise<Object|null>} Parsed backend response payload.
+ */
+async function uploadZipBlob(jobId, kind, blob) {
+  try {
+    return await uploadZipBlobOnce(jobId, kind, blob, {
+      retryStatuses: [404, 500, 502, 503, 504],
+    });
+  } catch (error) {
+    if (!error || !error.retryWake) {
+      throw error;
+    }
+
+    backendReady = false;
+    setStatus(
+      "running",
+      `pyKinaXe server is waking up again. Waiting to resume ${kind.toUpperCase()} upload...`
+    );
+    await ensureBackendReady({ announce: true, force: true });
+    return uploadZipBlobOnce(jobId, kind, blob, {
+      retryStatuses: [],
+    });
+  }
 }
 
 /**
