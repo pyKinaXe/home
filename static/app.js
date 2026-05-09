@@ -30,7 +30,6 @@ const resultsPanel = document.getElementById("resultsPanel");
 const resultMeta = document.getElementById("resultMeta");
 const kinaseResults = document.getElementById("kinaseResults");
 const heatmapResults = document.getElementById("heatmapResults");
-const downloadAllLink = document.getElementById("downloadAllLink");
 const logPanel = document.getElementById("logPanel");
 const viewerPresenceText = document.getElementById("viewerPresenceText");
 
@@ -511,14 +510,6 @@ function renderResults(payload) {
   kinaseResults.innerHTML = "";
   heatmapResults.innerHTML = "";
 
-  if (results.download_url) {
-    downloadAllLink.hidden = false;
-    downloadAllLink.href = absolutize(`${results.download_url}?cleanup=1`);
-    if (results.archive_name) {
-      downloadAllLink.download = results.archive_name;
-    }
-  }
-
   for (const item of results.kinase_outputs || []) {
     const card = document.createElement("article");
     card.className = "card";
@@ -951,8 +942,6 @@ async function startUpload() {
 
   runButton.disabled = true;
   resultsPanel.classList.add("hidden");
-  downloadAllLink.hidden = true;
-  downloadAllLink.removeAttribute("href");
   logPanel.innerHTML = `<div class="log-empty">Joining the upload queue...</div>`;
 
   try {
