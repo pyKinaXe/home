@@ -38,6 +38,7 @@ let activePollTimer = null;
 let activeJobId = null;
 let heartbeatTimer = null;
 let viewerHeartbeatTimer = null;
+let autoDownloadInFlight = false;
 const HEARTBEAT_INTERVAL_MS = 15000;
 const VIEWER_HEARTBEAT_INTERVAL_MS = 10000;
 const VIEWER_ID_KEY = "pykinaxe_viewer_id";
@@ -251,6 +252,24 @@ function releaseActiveJob() {
     } else {
       fetch(api(`/api/jobs/${jobId}/release`), { method: "POST", keepalive: true }).catch(() => {});
     }
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Release one specific job immediately while the page is still active.
+ *
+ * @param {string} jobId - Unique identifier of the job to release.
+ * @returns {Promise<void>}
+ */
+async function releaseJobNow(jobId) {
+  if (!jobId) return;
+  try {
+    await fetch(api(`/api/jobs/${jobId}/release`), {
+      method: "POST",
+      keepalive: true,
+    });
   } catch {
     // ignore
   }
@@ -504,6 +523,87 @@ function renderResults(payload) {
 }
 
 /**
+ * Infer a download filename from the Content-Disposition header when present.
+ *
+ * @param {Response} response - Download response from the backend.
+ * @param {string} fallbackName - Fallback filename when no header is available.
+ * @returns {string} Best-effort filename for the browser download.
+ */
+function inferDownloadFilename(response, fallbackName) {
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match && utf8Match[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch {
+      return utf8Match[1];
+    }
+  }
+
+  const asciiMatch = disposition.match(/filename=\"?([^\";]+)\"?/i);
+  if (asciiMatch && asciiMatch[1]) {
+    return asciiMatch[1];
+  }
+
+  return fallbackName;
+}
+
+/**
+ * Download the completed ZIP archive automatically, then release the job so
+ * the backend can delete uploaded inputs and generated artifacts.
+ *
+ * @param {Object} payload - Completed job payload returned by the backend.
+ * @returns {Promise<void>}
+ */
+async function autoDownloadResults(payload) {
+  if (autoDownloadInFlight) return;
+  const results = payload && payload.results;
+  if (!results || !results.download_url) return;
+
+  autoDownloadInFlight = true;
+  const jobId = payload.job_id;
+  const fallbackName = `pyKinaXe_results_${jobId}.zip`;
+
+  try {
+    setStatus("completed", "Analysis finished. Downloading ZIP archive...");
+    const response = await fetch(absolutize(results.download_url));
+    if (!response.ok) {
+      throw new Error(`Automatic ZIP download failed with HTTP ${response.status}.`);
+    }
+
+    const blob = await response.blob();
+    const blobUrl = window.URL.createObjectURL(blob);
+    const downloadLink = document.createElement("a");
+    downloadLink.href = blobUrl;
+    downloadLink.download = inferDownloadFilename(response, fallbackName);
+    downloadLink.style.display = "none";
+    document.body.appendChild(downloadLink);
+    downloadLink.click();
+    downloadLink.remove();
+    window.setTimeout(() => {
+      window.URL.revokeObjectURL(blobUrl);
+    }, 1000);
+
+    await releaseJobNow(jobId);
+    if (activeJobId === jobId) {
+      clearActiveJob();
+    }
+    setStatus(
+      "completed",
+      "Analysis finished. ZIP downloaded. Server-side job data has been scheduled for deletion."
+    );
+  } catch (error) {
+    setStatus(
+      "completed",
+      (error && error.message) ||
+        "Analysis finished, but automatic ZIP download failed. Use the download link below."
+    );
+  } finally {
+    autoDownloadInFlight = false;
+  }
+}
+
+/**
  * Poll the backend until the requested job reaches a terminal state.
  *
  * @param {string} jobId - Unique identifier of the job being monitored.
@@ -549,8 +649,7 @@ async function pollJob(jobId) {
     renderLogs(payload);
     renderResults(payload);
     runButton.disabled = false;
-    // Keep the heartbeat going while the user is reading results so the
-    // server doesn't reap the job folder out from under the download links.
+    await autoDownloadResults(payload);
   }
 }
 
