@@ -528,30 +528,95 @@ async function autoDownloadResults(payload) {
 
   autoDownloadInFlight = true;
   const jobId = payload.job_id;
-  const downloadUrl = absolutize(`${results.download_url}?cleanup=1`);
+  const downloadUrl = absolutize(results.download_url);
 
   try {
     setStatus("completed", "Analysis finished. Downloading ZIP archive...");
+    const response = await fetch(downloadUrl);
+    if (!response.ok) {
+      throw new Error(`ZIP download failed with HTTP ${response.status}.`);
+    }
+
+    const totalBytes = Number(response.headers.get("content-length"));
+    const contentDisposition = String(response.headers.get("content-disposition") || "");
+    const filenameMatch =
+      contentDisposition.match(/filename\*=UTF-8''([^;]+)/i) ||
+      contentDisposition.match(/filename=\"?([^\";]+)\"?/i);
+    const suggestedFilename = filenameMatch
+      ? decodeURIComponent(filenameMatch[1])
+      : `pyKinaXe_results_${jobId}.zip`;
+
+    let archiveBlob;
+    if (response.body && typeof response.body.getReader === "function") {
+      const reader = response.body.getReader();
+      const chunks = [];
+      let receivedBytes = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          chunks.push(value);
+          receivedBytes += value.byteLength;
+          if (Number.isFinite(totalBytes) && totalBytes > 0) {
+            const percent = Math.round((receivedBytes / totalBytes) * 100);
+            setStatus("completed", `Analysis finished. Downloading ZIP archive (${percent}%)...`);
+          } else {
+            const sizeMB = (receivedBytes / (1024 * 1024)).toFixed(1);
+            setStatus("completed", `Analysis finished. Downloading ZIP archive (${sizeMB} MB received)...`);
+          }
+        }
+      }
+
+      archiveBlob = new Blob(chunks, {
+        type: response.headers.get("content-type") || "application/zip",
+      });
+    } else {
+      archiveBlob = await response.blob();
+    }
+
+    setStatus("completed", "Analysis finished. Saving ZIP archive...");
+    const blobUrl = URL.createObjectURL(archiveBlob);
     const link = document.createElement("a");
-    link.href = downloadUrl;
+    link.href = blobUrl;
+    link.download = suggestedFilename;
     link.rel = "noopener";
     link.style.display = "none";
     document.body.appendChild(link);
     link.click();
     link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
 
     if (activeJobId === jobId) {
       clearActiveJob();
     }
+
+    setStatus("completed", "ZIP archive saved in the browser. Cleaning bucket-backed runtime...");
+    const cleanupResponse = await fetch(api(`/api/jobs/${jobId}/finalize_download`), {
+      method: "POST",
+    });
+    if (!cleanupResponse.ok) {
+      let cleanupPayload = null;
+      try {
+        cleanupPayload = await cleanupResponse.json();
+      } catch {
+        cleanupPayload = null;
+      }
+      throw new Error(
+        (cleanupPayload && cleanupPayload.error) ||
+          `Bucket cleanup failed with HTTP ${cleanupResponse.status}.`
+      );
+    }
+
     setStatus(
       "completed",
-      "Analysis finished. ZIP download has been triggered. The bucket-backed runtime will be wiped after the download response completes."
+      "Results downloaded. Bucket cleanup completed, and the next queued upload can proceed."
     );
   } catch (error) {
     setStatus(
       "completed",
       (error && error.message) ||
-        "Analysis finished, but automatic ZIP download failed. Use the download link below."
+        "Analysis finished, but automatic ZIP download or cleanup failed. Use the download link below."
     );
   } finally {
     autoDownloadInFlight = false;
