@@ -651,7 +651,7 @@ async function autoDownloadResults(payload) {
       "completed",
       "Results downloaded. Bucket cleanup completed, and the next queued upload can proceed."
     );
-    appendClientLog("Job finished successfully, results downloaded.");
+    appendClientLog("Results downloaded.");
   } catch (error) {
     setStatus(
       "completed",
