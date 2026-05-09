@@ -446,6 +446,42 @@ function renderLogs(payload) {
 }
 
 /**
+ * Append one client-side log line without waiting for another backend poll.
+ *
+ * @param {string} message - Human-readable message to append to the log panel.
+ * @returns {void}
+ */
+function appendClientLog(message) {
+  if (!message) return;
+
+  const empty = logPanel.querySelector(".log-empty");
+  if (empty) {
+    logPanel.innerHTML = "";
+  }
+
+  let list = logPanel.querySelector(".log-list");
+  if (!list) {
+    list = document.createElement("div");
+    list.className = "log-list";
+    logPanel.appendChild(list);
+  }
+
+  const item = document.createElement("div");
+  item.className = "log-item";
+  const timestamp = new Date().toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  item.innerHTML = `
+    <div class="log-time">${timestamp}</div>
+    <div class="log-message">${message}</div>
+  `;
+  list.appendChild(item);
+  logPanel.scrollTop = logPanel.scrollHeight;
+}
+
+/**
  * Convert a backend-relative URL into one usable by the current frontend.
  *
  * @param {string} url - Relative or absolute URL returned by the backend.
@@ -478,6 +514,9 @@ function renderResults(payload) {
   if (results.download_url) {
     downloadAllLink.hidden = false;
     downloadAllLink.href = absolutize(`${results.download_url}?cleanup=1`);
+    if (results.archive_name) {
+      downloadAllLink.download = results.archive_name;
+    }
   }
 
   for (const item of results.kinase_outputs || []) {
@@ -542,12 +581,9 @@ async function autoDownloadResults(payload) {
     const filenameMatch =
       contentDisposition.match(/filename\*=UTF-8''([^;]+)/i) ||
       contentDisposition.match(/filename=\"?([^\";]+)\"?/i);
-    const analysisTimestamp = String(results.analysis_timestamp || "")
-      .trim()
-      .replace(/[^0-9A-Za-z_-]+/g, "_");
     const suggestedFilename = filenameMatch
       ? decodeURIComponent(filenameMatch[1])
-      : `${analysisTimestamp || "results"}_pyKinaXe_results.zip`;
+      : String(results.archive_name || "").trim() || "pyKinaXe_results.zip";
 
     let archiveBlob;
     if (response.body && typeof response.body.getReader === "function") {
@@ -615,6 +651,7 @@ async function autoDownloadResults(payload) {
       "completed",
       "Results downloaded. Bucket cleanup completed, and the next queued upload can proceed."
     );
+    appendClientLog("Job finished successfully, results downloaded.");
   } catch (error) {
     setStatus(
       "completed",
