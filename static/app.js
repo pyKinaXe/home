@@ -1118,11 +1118,20 @@ async function startUpload() {
       throw new Error("The selected folder does not contain the expected ImageResults TIFFs and annotation/layout text files.");
     }
 
+    const selectedFolders = {
+      ptk: getSelectedFolderName(ptkFiles) || "",
+      stk: getSelectedFolderName(stkFiles) || "",
+    };
+
     await ensureBackendReady({ announce: true });
     setStatus("running", "Creating analysis job...");
     const initResponse = await fetchWithWake(
       api("/api/jobs/init"),
-      { method: "POST" },
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ selected_folders: selectedFolders }),
+      },
       { announceWake: true }
     );
 
