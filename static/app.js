@@ -49,6 +49,27 @@ const VIEWER_SESSION_KEY = "pykinaxe_viewer_session_id";
 const DEFAULT_IDLE_STATUS = "Waiting for input.";
 
 /**
+ * Format one timestamp into the user's local `YYYY-MM-DD HH:mm:ss` display.
+ *
+ * @param {string|Date|null|undefined} value - Raw timestamp value to format.
+ * @returns {string} User-local formatted timestamp, or an empty string.
+ */
+function formatLocalTimestamp(value) {
+  if (!value) return "";
+
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+
+  const year = String(date.getFullYear());
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const seconds = String(date.getSeconds()).padStart(2, "0");
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
+/**
  * Generate a random identifier for browser- or tab-level presence tracking.
  *
  * @returns {string} Generated identifier string.
@@ -547,8 +568,9 @@ function renderLogs(payload) {
   for (const entry of logs) {
     const item = document.createElement("div");
     item.className = "log-item";
+    const timestamp = formatLocalTimestamp(entry.timestamp);
     item.innerHTML = `
-      <div class="log-time">${entry.timestamp || ""}</div>
+      <div class="log-time">${timestamp}</div>
       <div class="log-message">${entry.message || ""}</div>
     `;
     list.appendChild(item);
@@ -581,11 +603,7 @@ function appendClientLog(message) {
 
   const item = document.createElement("div");
   item.className = "log-item";
-  const timestamp = new Date().toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
+  const timestamp = formatLocalTimestamp(new Date());
   item.innerHTML = `
     <div class="log-time">${timestamp}</div>
     <div class="log-message">${message}</div>
@@ -620,7 +638,8 @@ function absolutize(url) {
 function renderResults(payload) {
   const results = payload.results;
   resultsPanel.classList.remove("hidden");
-  resultMeta.textContent = `Job ${payload.job_id} finished at ${payload.finished_at || "unknown time"}.`;
+  const finishedAt = formatLocalTimestamp(payload.finished_at);
+  resultMeta.textContent = `Job ${payload.job_id} finished at ${finishedAt || "unknown time"}.`;
   kinaseResults.innerHTML = "";
   heatmapResults.innerHTML = "";
 
