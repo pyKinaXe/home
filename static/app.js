@@ -40,8 +40,14 @@ let viewerHeartbeatTimer = null;
 let autoDownloadInFlight = false;
 let backendReady = false;
 let backendWarmupPromise = null;
+let fallbackViewerId = null;
+let fallbackViewerSessionId = null;
+let activeJobCompleted = false;
+let activeJobDownloadSettled = false;
+let activeJobResultsExpired = false;
 const HEARTBEAT_INTERVAL_MS = 15000;
 const VIEWER_HEARTBEAT_INTERVAL_MS = 10000;
+const DOWNLOAD_INACTIVITY_TIMEOUT_MS = 120000;
 const BACKEND_WARMUP_MAX_ATTEMPTS = 24;
 const BACKEND_WARMUP_INTERVAL_MS = 2500;
 const VIEWER_ID_KEY = "pykinaxe_viewer_id";
@@ -95,7 +101,8 @@ function getViewerId() {
     }
     return viewerId;
   } catch {
-    return generateClientId();
+    if (!fallbackViewerId) fallbackViewerId = generateClientId();
+    return fallbackViewerId;
   }
 }
 
@@ -113,7 +120,8 @@ function getViewerSessionId() {
     }
     return sessionId;
   } catch {
-    return generateClientId();
+    if (!fallbackViewerSessionId) fallbackViewerSessionId = generateClientId();
+    return fallbackViewerSessionId;
   }
 }
 
@@ -172,13 +180,14 @@ async function sendViewerHeartbeat() {
       }),
       keepalive: true,
     });
-    if (!response.ok) return;
+    if (!response.ok) {
+      setViewerPresence(Number.NaN);
+      return;
+    }
     const payload = await response.json();
     setViewerPresence(Number(payload.viewer_count));
   } catch {
-    if (viewerPresenceText && !viewerPresenceText.textContent.trim()) {
-      viewerPresenceText.textContent = "Online now unavailable";
-    }
+    setViewerPresence(Number.NaN);
   }
 }
 
@@ -247,14 +256,34 @@ function stopHeartbeat() {
 function startHeartbeat(jobId) {
   stopHeartbeat();
   activeJobId = jobId;
+  activeJobCompleted = false;
+  activeJobDownloadSettled = false;
+  activeJobResultsExpired = false;
+  const watchedJobId = jobId;
   heartbeatTimer = window.setInterval(() => {
-    if (!activeJobId) return;
+    if (activeJobId !== watchedJobId) return;
     // Best-effort: ignore network errors. The server's reaper will use this
     // to know the client is still alive.
-    fetch(api(`/api/jobs/${activeJobId}/heartbeat`), {
+    fetch(api(`/api/jobs/${watchedJobId}/heartbeat`), {
       method: "POST",
       keepalive: true,
-    }).catch(() => {});
+    })
+      .then((response) => {
+        if (
+          activeJobId === watchedJobId &&
+          (response.status === 404 || response.status === 410)
+        ) {
+          // While a job is still queued/running, the status poll owns failure
+          // handling. Once completed, stop retaining vanished server results;
+          // if a ZIP stream is still settling, let it finish before clearing
+          // the active-job identity so the Run button cannot become wedged.
+          if (!activeJobCompleted) return;
+          activeJobResultsExpired = true;
+          stopHeartbeat();
+          if (activeJobDownloadSettled) finishExpiredResultsState();
+        }
+      })
+      .catch(() => {});
   }, HEARTBEAT_INTERVAL_MS);
 }
 
@@ -291,6 +320,23 @@ function releaseActiveJob() {
 function clearActiveJob() {
   stopHeartbeat();
   activeJobId = null;
+  activeJobCompleted = false;
+  activeJobDownloadSettled = false;
+  activeJobResultsExpired = false;
+}
+
+/**
+ * Finish browser bookkeeping after the server has expired completed results.
+ *
+ * @returns {void}
+ */
+function finishExpiredResultsState() {
+  clearActiveJob();
+  runButton.disabled = false;
+  setStatus(
+    "completed",
+    "Temporary server results have expired. Keep the downloaded ZIP archive; rerun if it did not finish."
+  );
 }
 
 // Refresh, navigation, tab close, window close all trigger pagehide.
@@ -368,8 +414,13 @@ function formatComparisonLabel(value) {
   } else if (text.startsWith("Control ")) {
     text = text.slice("Control ".length);
   }
-  // Insert a space between "Test" and a trailing number, e.g. "Test1" -> "Test 1".
-  return text.replace(/\bTest(\d+)\b/g, "Test $1");
+  // Keep labels readable without losing any underscore-delimited name segment.
+  return text
+    .replace(/~vs~/gi, " vs ")
+    .replace(/_/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/\bTest(\d+)\b/g, "Test $1")
+    .trim();
 }
 
 /**
@@ -380,17 +431,22 @@ function formatComparisonLabel(value) {
  */
 // Derive a concise display title from one generated peptide heatmap filename.
 function formatHeatmapTitle(filename) {
-  // Strip extension and the well-known prefix, then take the last
-  // underscore-delimited token (the test condition), e.g.
-  //   "peptides_heatmap_Control_Test1.png" -> "Test 1"
+  // Strip extension and the well-known prefix. Preserve every remaining name
+  // segment because legacy filenames do not encode where an underscore-rich
+  // control ends and the condition begins. A leading PTK/STK token is kept as
+  // a prefix because peptide heatmaps are drawn per array.
   let text = String(filename || "").trim();
   text = text.replace(/\.[^.]+$/, "");
   text = text.replace(/^peptides[_\s-]*heatmap[_\s-]*/i, "");
   const parts = text.split("_").filter(Boolean);
-  if (parts.length > 0) {
-    text = parts[parts.length - 1];
+  let array = "";
+  if (parts.length > 0 && /^(PTK|STK)$/i.test(parts[0])) {
+    array = `${parts.shift().toUpperCase()} — `;
   }
-  return formatComparisonLabel(text);
+  if (parts.length > 0) {
+    text = parts.join("_");
+  }
+  return `${array}${formatComparisonLabel(text)}`;
 }
 
 /**
@@ -483,8 +539,8 @@ async function ensureBackendReady(options = {}) {
 }
 
 /**
- * Fetch one API resource and retry once after an explicit warm-up cycle when
- * the backend looks asleep or temporarily unavailable.
+ * Fetch one API resource and retry safe/idempotent reads once after an explicit
+ * warm-up cycle when the backend looks asleep or temporarily unavailable.
  *
  * @param {string} url - Absolute or API-relative URL to fetch.
  * @param {RequestInit} options - Fetch options.
@@ -493,16 +549,22 @@ async function ensureBackendReady(options = {}) {
  */
 async function fetchWithWake(url, options = {}, extra = {}) {
   const { announceWake = false } = extra;
+  const method = String(options.method || "GET").toUpperCase();
+  const canRetry = ["GET", "HEAD", "OPTIONS"].includes(method);
 
   try {
     const response = await fetch(url, options);
-    if (!shouldRetryWake(response)) {
+    if (!shouldRetryWake(response) || !canRetry) {
       if (response.ok) {
         backendReady = true;
       }
       return response;
     }
-  } catch {
+  } catch (error) {
+    if (error && error.name === "AbortError") throw error;
+    // A POST may already have succeeded even if its response was lost. Retrying
+    // it could create a duplicate job or advance one state transition twice.
+    if (!canRetry) throw error;
     // Network failures can happen while the Space is still starting up.
   }
 
@@ -569,10 +631,13 @@ function renderLogs(payload) {
     const item = document.createElement("div");
     item.className = "log-item";
     const timestamp = formatLocalTimestamp(entry.timestamp);
-    item.innerHTML = `
-      <div class="log-time">${timestamp}</div>
-      <div class="log-message">${entry.message || ""}</div>
-    `;
+    const time = document.createElement("div");
+    time.className = "log-time";
+    time.textContent = timestamp;
+    const message = document.createElement("div");
+    message.className = "log-message";
+    message.textContent = entry.message || "";
+    item.append(time, message);
     list.appendChild(item);
   }
 
@@ -604,10 +669,13 @@ function appendClientLog(message) {
   const item = document.createElement("div");
   item.className = "log-item";
   const timestamp = formatLocalTimestamp(new Date());
-  item.innerHTML = `
-    <div class="log-time">${timestamp}</div>
-    <div class="log-message">${message}</div>
-  `;
+  const time = document.createElement("div");
+  time.className = "log-time";
+  time.textContent = timestamp;
+  const logMessage = document.createElement("div");
+  logMessage.className = "log-message";
+  logMessage.textContent = message;
+  item.append(time, logMessage);
   list.appendChild(item);
   logPanel.scrollTop = logPanel.scrollHeight;
 }
@@ -634,41 +702,79 @@ function absolutize(url) {
  * @param {Object} payload - Completed job payload returned by the backend.
  * @returns {void}
  */
-// Render the completed-job outputs such as workbooks, heatmaps, and downloads.
+// Render the completed-job outputs such as result tables, heatmaps, and downloads.
 function renderResults(payload) {
   const results = payload.results;
   resultsPanel.classList.remove("hidden");
   const finishedAt = formatLocalTimestamp(payload.finished_at);
-  resultMeta.textContent = `Job ${payload.job_id} finished at ${finishedAt || "unknown time"}.`;
+  resultMeta.replaceChildren();
+  resultMeta.append(
+    document.createTextNode(
+      `Job ${payload.job_id} finished at ${finishedAt || "unknown time"}.`
+    )
+  );
+  if (results.download_url) {
+    const archiveLink = document.createElement("a");
+    archiveLink.href = absolutize(results.download_url);
+    archiveLink.textContent = "Download ZIP archive";
+    archiveLink.rel = "noopener";
+    resultMeta.append(document.createTextNode(" "), archiveLink);
+  }
   kinaseResults.innerHTML = "";
   heatmapResults.innerHTML = "";
 
   for (const item of results.kinase_outputs || []) {
     const card = document.createElement("article");
     card.className = "card";
-    const workbookUrl = absolutize(item.workbook_url);
-    card.innerHTML = `
-      <h4>${formatComparisonLabel(item.comparison)}</h4>
-      <p class="muted">Workbook: <a href="${workbookUrl}" target="_blank" rel="noopener">${item.workbook_name}</a></p>
-      <div class="csv-line">${item.kinase_csv || "No significant kinases found."}</div>
-    `;
+    const tableUrl = absolutize(item.table_url || item.workbook_url);
+    const tableName = item.table_name || item.workbook_name || "Result table";
+    const title = document.createElement("h4");
+    title.textContent = formatComparisonLabel(item.comparison);
+    const tableLine = document.createElement("p");
+    tableLine.className = "muted";
+    tableLine.append(document.createTextNode("Table: "));
+    if (tableUrl) {
+      const tableLink = document.createElement("a");
+      tableLink.href = tableUrl;
+      tableLink.target = "_blank";
+      tableLink.rel = "noopener";
+      tableLink.textContent = tableName;
+      tableLine.append(tableLink);
+    } else {
+      tableLine.append(document.createTextNode(tableName));
+    }
+    const kinaseList = document.createElement("div");
+    kinaseList.className = "csv-line";
+    kinaseList.textContent = item.kinase_csv || "No significant kinases found.";
+    card.append(title, tableLine, kinaseList);
     kinaseResults.appendChild(card);
   }
 
   if ((results.kinase_outputs || []).length === 0) {
-    kinaseResults.innerHTML = `<div class="card"><div class="csv-line">No Kinases_Significant output was found.</div></div>`;
+    kinaseResults.innerHTML = `<div class="card"><div class="csv-line">No significant-kinase table was found.</div></div>`;
   }
 
   for (const item of results.heatmaps || []) {
     const card = document.createElement("article");
     card.className = "card heatmap-card";
-    const prettyName = formatHeatmapTitle(item.filename);
+    const prettyName = formatComparisonLabel(
+      item.comparison || formatHeatmapTitle(item.filename)
+    );
     const imgUrl = absolutize(item.url);
-    card.innerHTML = `
-      <h4>${prettyName}</h4>
-      <p class="muted"><a href="${imgUrl}" target="_blank" rel="noopener">Open image in a new tab</a></p>
-      <img src="${imgUrl}" alt="${prettyName}">
-    `;
+    const title = document.createElement("h4");
+    title.textContent = prettyName;
+    const imageLine = document.createElement("p");
+    imageLine.className = "muted";
+    const imageLink = document.createElement("a");
+    imageLink.href = imgUrl;
+    imageLink.target = "_blank";
+    imageLink.rel = "noopener";
+    imageLink.textContent = "Open image in a new tab";
+    imageLine.append(imageLink);
+    const image = document.createElement("img");
+    image.src = imgUrl;
+    image.alt = prettyName;
+    card.append(title, imageLine, image);
     heatmapResults.appendChild(card);
   }
 
@@ -678,8 +784,9 @@ function renderResults(payload) {
 }
 
 /**
- * Download the completed ZIP archive automatically, then release the job so
- * the backend can delete uploaded inputs and generated artifacts.
+ * Download the completed ZIP archive automatically. The completed job remains
+ * available while this page is open so its table and heatmap links keep working;
+ * page exit, starting another job, or the server retention ceiling releases it.
  *
  * @param {Object} payload - Completed job payload returned by the backend.
  * @returns {Promise<void>}
@@ -690,15 +797,30 @@ async function autoDownloadResults(payload) {
   if (!results || !results.download_url) return;
 
   autoDownloadInFlight = true;
-  const jobId = payload.job_id;
   const downloadUrl = absolutize(results.download_url);
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  let inactivityTimer = null;
+  let downloadTimedOut = false;
+
+  const armInactivityTimeout = () => {
+    if (!controller) return;
+    if (inactivityTimer !== null) window.clearTimeout(inactivityTimer);
+    inactivityTimer = window.setTimeout(() => {
+      downloadTimedOut = true;
+      controller.abort();
+    }, DOWNLOAD_INACTIVITY_TIMEOUT_MS);
+  };
 
   try {
     setStatus("completed", "Analysis finished. Downloading ZIP archive...");
-    const response = await fetchWithWake(downloadUrl, { method: "GET" }, { announceWake: true });
+    armInactivityTimeout();
+    const requestOptions = { method: "GET" };
+    if (controller) requestOptions.signal = controller.signal;
+    const response = await fetchWithWake(downloadUrl, requestOptions, { announceWake: true });
     if (!response.ok) {
       throw new Error(`ZIP download failed with HTTP ${response.status}.`);
     }
+    armInactivityTimeout();
 
     const totalBytes = Number(response.headers.get("content-length"));
     const contentDisposition = String(response.headers.get("content-disposition") || "");
@@ -718,6 +840,7 @@ async function autoDownloadResults(payload) {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        armInactivityTimeout();
         if (value) {
           chunks.push(value);
           receivedBytes += value.byteLength;
@@ -737,6 +860,10 @@ async function autoDownloadResults(payload) {
     } else {
       archiveBlob = await response.blob();
     }
+    if (inactivityTimer !== null) {
+      window.clearTimeout(inactivityTimer);
+      inactivityTimer = null;
+    }
 
     setStatus("completed", "Analysis finished. Saving ZIP archive...");
     const blobUrl = URL.createObjectURL(archiveBlob);
@@ -750,41 +877,21 @@ async function autoDownloadResults(payload) {
     link.remove();
     window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
 
-    if (activeJobId === jobId) {
-      clearActiveJob();
-    }
-
-    setStatus("completed", "ZIP archive saved in the browser. Cleaning bucket-backed runtime...");
-    const cleanupResponse = await fetchWithWake(
-      api(`/api/jobs/${jobId}/finalize_download`),
-      { method: "POST" },
-      { announceWake: true }
-    );
-    if (!cleanupResponse.ok) {
-      let cleanupPayload = null;
-      try {
-        cleanupPayload = await cleanupResponse.json();
-      } catch {
-        cleanupPayload = null;
-      }
-      throw new Error(
-        (cleanupPayload && cleanupPayload.error) ||
-          `Bucket cleanup failed with HTTP ${cleanupResponse.status}.`
-      );
-    }
-
     setStatus(
       "completed",
-      "Results downloaded, pyKinaXe is ready for the next upload!"
+      "Results downloaded. Tables and heatmaps remain temporarily available until server retention expires."
     );
     appendClientLog("Results downloaded.");
   } catch (error) {
     setStatus(
       "completed",
-      (error && error.message) ||
-        "Analysis finished, but automatic ZIP download or cleanup failed. Use the download link below."
+      (downloadTimedOut &&
+        "Automatic ZIP download stalled. Use the download link below instead.") ||
+        (error && error.message) ||
+        "Analysis finished, but automatic ZIP download failed. Use the download link below."
     );
   } finally {
+    if (inactivityTimer !== null) window.clearTimeout(inactivityTimer);
     autoDownloadInFlight = false;
   }
 }
@@ -1016,6 +1123,28 @@ async function beginQueuedUpload(jobId, uploadPlan) {
 }
 
 /**
+ * Schedule the next status poll and convert asynchronous polling failures into
+ * a visible terminal state instead of an unhandled promise rejection.
+ *
+ * @param {string} jobId - Job that must still be active when the timer fires.
+ * @param {Object|null} uploadPlan - Client-side upload plan retained for its turn.
+ * @param {number} delayMs - Delay before polling again.
+ * @returns {void}
+ */
+function scheduleJobPoll(jobId, uploadPlan, delayMs) {
+  activePollTimer = window.setTimeout(() => {
+    activePollTimer = null;
+    void pollJob(jobId, uploadPlan).catch((error) => {
+      if (activeJobId !== jobId) return;
+      setStatus("failed", (error && error.message) || "Job polling failed.");
+      runButton.disabled = false;
+      releaseActiveJob();
+      clearActiveJob();
+    });
+  }, delayMs);
+}
+
+/**
  * Poll the backend until the requested job reaches a terminal state.
  *
  * @param {string} jobId - Unique identifier of the job being monitored.
@@ -1024,27 +1153,34 @@ async function beginQueuedUpload(jobId, uploadPlan) {
  */
 // Poll the backend until the current job reaches a terminal state.
 async function pollJob(jobId, uploadPlan = null) {
+  if (activeJobId !== jobId) return;
   const response = await fetchWithWake(
     api(`/api/jobs/${jobId}`),
     { method: "GET", cache: "no-store" },
     { announceWake: false }
   );
+  // Ignore an old in-flight response after the user starts/replaces a job.
+  if (activeJobId !== jobId) return;
   if (!response.ok) {
     if (response.status === 404) {
       setStatus("failed", "This job is no longer available on the server.");
       runButton.disabled = false;
+      clearActiveJob();
       return;
     }
     setStatus("failed", `Job polling failed with HTTP ${response.status}.`);
     runButton.disabled = false;
+    releaseActiveJob();
+    clearActiveJob();
     return;
   }
   const payload = await response.json();
+  if (activeJobId !== jobId) return;
   renderLogs(payload);
 
   if (payload.status === "waiting_for_upload") {
     setStatus("running", formatQueuedStatus(payload));
-    activePollTimer = window.setTimeout(() => pollJob(jobId, uploadPlan), 2500);
+    scheduleJobPoll(jobId, uploadPlan, 2500);
     return;
   }
 
@@ -1061,25 +1197,25 @@ async function pollJob(jobId, uploadPlan = null) {
       }
       return;
     }
-    activePollTimer = window.setTimeout(() => pollJob(jobId, uploadPlan), 1500);
+    scheduleJobPoll(jobId, uploadPlan, 1500);
     return;
   }
 
   if (payload.status === "uploading") {
     setStatus("running", payload.message || "Uploading selected PTK/STK data...");
-    activePollTimer = window.setTimeout(() => pollJob(jobId, uploadPlan), 2500);
+    scheduleJobPoll(jobId, uploadPlan, 2500);
     return;
   }
 
   if (payload.status === "queued") {
     setStatus("running", formatQueuedStatus(payload));
-    activePollTimer = window.setTimeout(() => pollJob(jobId, uploadPlan), 2500);
+    scheduleJobPoll(jobId, uploadPlan, 2500);
     return;
   }
 
   if (payload.status === "starting" || payload.status === "running") {
     setStatus("running", payload.message || "Analysis is running...");
-    activePollTimer = window.setTimeout(() => pollJob(jobId, uploadPlan), 2500);
+    scheduleJobPoll(jobId, uploadPlan, 2500);
     return;
   }
 
@@ -1092,11 +1228,19 @@ async function pollJob(jobId, uploadPlan = null) {
   }
 
   if (payload.status === "completed") {
+    activeJobCompleted = true;
     setStatus("completed", payload.message || "Analysis finished.");
     renderLogs(payload);
     renderResults(payload);
-    runButton.disabled = false;
     await autoDownloadResults(payload);
+    if (activeJobId === jobId) {
+      activeJobDownloadSettled = true;
+      if (activeJobResultsExpired) {
+        finishExpiredResultsState();
+      } else {
+        runButton.disabled = false;
+      }
+    }
   }
 }
 
