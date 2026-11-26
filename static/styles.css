@@ -744,13 +744,25 @@ button:disabled {
   color: var(--muted);
 }
 
-/* One heatmap per row: the PNGs are rendered at 300 dpi (roughly 1200-1500 px
-   wide), so a multi-column grid shrank them far below their resolution. */
+/* The grid only scales the preview: each <img> holds the full 300 dpi PNG, and
+   "Open in a new tab" shows it at full resolution. */
 .heatmaps {
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 18px;
   margin-top: 14px;
+}
+
+@media (max-width: 1100px) {
+  .heatmaps {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  .heatmaps {
+    grid-template-columns: 1fr;
+  }
 }
 
 .heatmap-card {
@@ -759,10 +771,8 @@ button:disabled {
 }
 
 .heatmap-card img {
-  width: auto;
+  width: 100%;
   max-width: 100%;
-  height: auto;
-  align-self: center;
   display: block;
   border-radius: 12px;
   border: 1px solid var(--line);

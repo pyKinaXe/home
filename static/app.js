@@ -670,6 +670,7 @@ function renderResults(payload) {
     const imgUrl = absolutize(item.url);
     card.innerHTML = `
       <h4>${prettyName}</h4>
+      <p class="muted"><a class="heatmap-open" href="${imgUrl}" target="_blank" rel="noopener">Open in a new tab</a></p>
       <img src="${imgUrl}" alt="${prettyName}" data-archive-path="${item.relative_path || ""}">
     `;
     heatmapResults.appendChild(card);
@@ -691,13 +692,15 @@ function revokeResultObjectUrls() {
 }
 
 /**
- * Point the heatmap images at their copies inside the downloaded ZIP.
+ * Point the heatmap images and their "Open in a new tab" links at copies
+ * inside the downloaded ZIP.
  *
  * After the download the backend deletes the job, so the server URLs the
- * images were rendered with return 404 from then on; an image that had not
- * finished loading by then would stay broken. The archive keeps the same
- * relative paths as the job's result tree, so each image is read from the ZIP
- * the browser already holds and served through an object URL instead.
+ * images were rendered with return 404 from then on. The archive keeps the
+ * same relative paths as the job's result tree, so each image is read from the
+ * ZIP the browser already holds and served through an object URL, which both
+ * the <img> and its link then use. A link whose image could not be taken from
+ * the ZIP is removed rather than left pointing at the deleted server copy.
  *
  * @param {Blob} archiveBlob - The downloaded results ZIP.
  * @returns {Promise<void>}
@@ -706,23 +709,27 @@ async function relinkResultsToArchive(archiveBlob) {
   const images = document.querySelectorAll("#heatmapResults img[data-archive-path]");
   if (images.length === 0) return;
 
-  let zip;
+  let zip = null;
   try {
     if (typeof JSZip === "undefined") throw new Error("JSZip is not available.");
     zip = await JSZip.loadAsync(archiveBlob);
   } catch (error) {
     console.warn("Could not read the results ZIP for the heatmap images:", error);
-    return;
   }
 
   for (const image of images) {
+    const link = image.closest(".heatmap-card")?.querySelector("a.heatmap-open");
     const archivePath = String(image.dataset.archivePath || "").replace(/\\/g, "/");
-    const entry = archivePath ? zip.file(archivePath) : null;
-    if (!entry) continue;
+    const entry = zip && archivePath ? zip.file(archivePath) : null;
+    if (!entry) {
+      if (link) link.closest("p").remove();
+      continue;
+    }
     const content = await entry.async("blob");
     const objectUrl = URL.createObjectURL(new Blob([content], { type: "image/png" }));
     resultObjectUrls.push(objectUrl);
     image.src = objectUrl;
+    if (link) link.href = objectUrl;
   }
 }
 
