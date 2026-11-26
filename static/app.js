@@ -36,6 +36,9 @@ let viewerHeartbeatTimer = null;
 let autoDownloadInFlight = false;
 let backendReady = false;
 let backendWarmupPromise = null;
+// Object URLs for result files taken from the downloaded ZIP; revoked when the
+// next result set is rendered.
+let resultObjectUrls = [];
 const HEARTBEAT_INTERVAL_MS = 15000;
 const VIEWER_HEARTBEAT_INTERVAL_MS = 10000;
 const BACKEND_WARMUP_MAX_ATTEMPTS = 24;
@@ -644,14 +647,13 @@ function renderResults(payload) {
   resultMeta.textContent = `Job ${payload.job_id} finished at ${finishedAt || "unknown time"}.`;
   kinaseResults.innerHTML = "";
   heatmapResults.innerHTML = "";
+  revokeResultObjectUrls();
 
   for (const item of results.kinase_outputs || []) {
     const card = document.createElement("article");
     card.className = "card";
-    const tableUrl = absolutize(item.table_url);
     card.innerHTML = `
       <h4>${formatComparisonLabel(item.comparison)}</h4>
-      <p class="muted">Table: <a href="${tableUrl}" target="_blank" rel="noopener">${item.table_name}</a></p>
       <div class="csv-line">${item.kinase_csv || "No significant kinases found."}</div>
     `;
     kinaseResults.appendChild(card);
@@ -668,14 +670,59 @@ function renderResults(payload) {
     const imgUrl = absolutize(item.url);
     card.innerHTML = `
       <h4>${prettyName}</h4>
-      <p class="muted"><a href="${imgUrl}" target="_blank" rel="noopener">Open image in a new tab</a></p>
-      <img src="${imgUrl}" alt="${prettyName}">
+      <img src="${imgUrl}" alt="${prettyName}" data-archive-path="${item.relative_path || ""}">
     `;
     heatmapResults.appendChild(card);
   }
 
   if ((results.heatmaps || []).length === 0) {
     heatmapResults.innerHTML = `<div class="card"><div class="csv-line">No peptide heatmap images were found.</div></div>`;
+  }
+}
+
+/**
+ * Release the object URLs created for the previous result set.
+ *
+ * @returns {void}
+ */
+function revokeResultObjectUrls() {
+  for (const url of resultObjectUrls) URL.revokeObjectURL(url);
+  resultObjectUrls = [];
+}
+
+/**
+ * Point the heatmap images at their copies inside the downloaded ZIP.
+ *
+ * After the download the backend deletes the job, so the server URLs the
+ * images were rendered with return 404 from then on; an image that had not
+ * finished loading by then would stay broken. The archive keeps the same
+ * relative paths as the job's result tree, so each image is read from the ZIP
+ * the browser already holds and served through an object URL instead.
+ *
+ * @param {Blob} archiveBlob - The downloaded results ZIP.
+ * @returns {Promise<void>}
+ */
+async function relinkResultsToArchive(archiveBlob) {
+  const images = document.querySelectorAll("#heatmapResults img[data-archive-path]");
+  if (images.length === 0) return;
+
+  let zip;
+  try {
+    if (typeof JSZip === "undefined") throw new Error("JSZip is not available.");
+    zip = await JSZip.loadAsync(archiveBlob);
+  } catch (error) {
+    console.warn("Could not read the results ZIP for the heatmap images:", error);
+    return;
+  }
+
+  for (const image of images) {
+    const archivePath = String(image.dataset.archivePath || "").replace(/\\/g, "/");
+    const entry = archivePath ? zip.file(archivePath) : null;
+    if (!entry) continue;
+    const content = await entry.async("blob");
+    const objectUrl = URL.createObjectURL(new Blob([content], { type: "image/png" }));
+    resultObjectUrls.push(objectUrl);
+    image.src = objectUrl;
   }
 }
 
@@ -755,6 +802,9 @@ async function autoDownloadResults(payload) {
     if (activeJobId === jobId) {
       clearActiveJob();
     }
+
+    // Must happen before finalize_download deletes the server copy.
+    await relinkResultsToArchive(archiveBlob);
 
     setStatus("completed", "ZIP archive saved in the browser. Cleaning bucket-backed runtime...");
     const cleanupResponse = await fetchWithWake(
